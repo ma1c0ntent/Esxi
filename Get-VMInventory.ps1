@@ -5,13 +5,11 @@
     DNS hostname resolution and network reachability.
 
 .DESCRIPTION
-    For each target server this script:
-      - Connects via VCF.PowerCLI (Connect-VIServer)
-      - Enumerates all VMs and retrieves Name, primary IP, and GuestId
-      - Normalises the raw GuestId into a human-readable OS label
-      - Performs a reverse-DNS lookup and compares the result to the VM name
-      - Pings each VM to verify network connectivity
-      - Exports all results to a timestamped CSV
+    Can be used two ways:
+      1. Directly:  .\Get-VMInventory.ps1 -Server vcenter01 -OutputDir C:\Reports
+      2. Dot-sourced and called as a function:
+            . .\Get-VMInventory.ps1
+            Get-VMInventory -Server vcenter01 -OutputDir C:\Reports
 
 .PARAMETER Server
     One or more vCenter / ESXi hostnames or IP addresses to query.
@@ -26,27 +24,36 @@
 .PARAMETER PingCount
     Number of ICMP echo requests sent per VM. Default: 2.
 
+.PARAMETER PassThru
+    If specified, returns the result objects to the pipeline in addition to
+    writing the CSV. Useful when calling as a function and piping results onward.
+
 .EXAMPLE
-    .\Get-VMInventory.ps1 -Server vcenter01.corp.local, vcenter02.corp.local `
-                          -Credential (Get-Credential) `
-                          -OutputDir C:\Reports
+    # Run directly as a script
+    .\Get-VMInventory.ps1 -Server vcenter01.corp.local -OutputDir C:\Reports
+
+.EXAMPLE
+    # Dot-source and call as a function
+    . .\Get-VMInventory.ps1
+    Get-VMInventory -Server vcenter01.corp.local, vcenter02.corp.local `
+                    -Credential (Get-Credential) -PassThru
+
+.EXAMPLE
+    # Pipe results into further filtering
+    . .\Get-VMInventory.ps1
+    Get-VMInventory -Server vcenter01.corp.local | Where-Object { -not $_.PingReachable }
 #>
 
-[CmdletBinding()]
+#region ── Script-level parameters (used when run directly) ──────────────────
 param (
-    [Parameter(Mandatory)]
     [string[]] $Server,
-
     [PSCredential] $Credential,
-
     [string] $OutputDir = (Get-Location).Path,
-
     [ValidateRange(1,10)]
-    [int] $PingCount = 2
+    [int] $PingCount = 2,
+    [switch] $PassThru
 )
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Continue'
+#endregion
 
 #region ── Helper: normalise GuestId to a friendly OS label ──────────────────
 function Get-NormalisedOS {
@@ -114,7 +121,6 @@ function Get-NormalisedOS {
         'otherlinux'        { return 'Linux (other)' }
         'other'             { return 'Other / Unknown' }
 
-        # ── Fallback: return the raw GuestId so nothing is lost ───────────────
         default             { return $GuestId }
     }
 }
@@ -128,105 +134,145 @@ function Resolve-IPtoHostname {
 
     try {
         $entry = [System.Net.Dns]::GetHostEntry($IPAddress)
-        # HostName is the FQDN; return just the short name for comparison
         return $entry.HostName.Split('.')[0]
     }
     catch {
-        return $null   # no PTR record / unreachable DNS
+        return $null
     }
 }
 #endregion
 
-#region ── Prompt for credential once if not supplied ────────────────────────
-if (-not $Credential) {
-    $Credential = Get-Credential -Message 'Enter credentials for vCenter/ESXi access'
-}
-#endregion
+#region ── Main function ─────────────────────────────────────────────────────
+function Get-VMInventory {
+<#
+.SYNOPSIS
+    Collects VM inventory from one or more ESXi/vCenter servers.
 
-#region ── Main collection loop ───────────────────────────────────────────────
-$allResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+.PARAMETER Server
+    One or more vCenter / ESXi hostnames or IP addresses to query.
 
-foreach ($srv in $Server) {
-    Write-Host "`n[+] Connecting to $srv ..." -ForegroundColor Cyan
+.PARAMETER Credential
+    PSCredential for vCenter/ESXi authentication. Prompts if omitted.
 
-    try {
-        $viConn = Connect-VIServer -Server $srv -Credential $Credential -ErrorAction Stop
-        Write-Host "    Connected as $($viConn.User)" -ForegroundColor Green
+.PARAMETER OutputDir
+    Directory for the output CSV. Defaults to the current directory.
+
+.PARAMETER PingCount
+    ICMP echo requests per VM. Default: 2.
+
+.PARAMETER PassThru
+    Returns result objects to the pipeline in addition to writing the CSV.
+#>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [string[]] $Server,
+
+        [PSCredential] $Credential,
+
+        [string] $OutputDir = (Get-Location).Path,
+
+        [ValidateRange(1,10)]
+        [int] $PingCount = 2,
+
+        [switch] $PassThru
+    )
+
+    begin {
+        $allResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+        if (-not $Credential) {
+            $Credential = Get-Credential -Message 'Enter credentials for vCenter/ESXi access'
+        }
     }
-    catch {
-        Write-Warning "    FAILED to connect to $srv : $_"
-        continue
+
+    process {
+        foreach ($srv in $Server) {
+            Write-Host "`n[+] Connecting to $srv ..." -ForegroundColor Cyan
+
+            try {
+                $viConn = Connect-VIServer -Server $srv -Credential $Credential -ErrorAction Stop
+                Write-Host "    Connected as $($viConn.User)" -ForegroundColor Green
+            }
+            catch {
+                Write-Warning "    FAILED to connect to $srv : $_"
+                continue
+            }
+
+            $vms = Get-VM -Server $viConn
+            Write-Host "    Found $($vms.Count) VM(s)" -ForegroundColor Green
+
+            foreach ($vm in $vms) {
+                Write-Verbose "  Processing VM: $($vm.Name)"
+
+                $primaryIP = $vm.Guest.IPAddress |
+                                 Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } |
+                                 Select-Object -First 1
+
+                $rawGuestId   = $vm.ExtensionData.Config.GuestId
+                $normalisedOS = Get-NormalisedOS -GuestId $rawGuestId
+
+                $resolvedHost     = Resolve-IPtoHostname -IPAddress $primaryIP
+                $dnsMatchesVMName = if ($resolvedHost) {
+                    $resolvedHost -ieq $vm.Name
+                } else {
+                    $false
+                }
+
+                $pingResult = if ($primaryIP) {
+                    Test-Connection -ComputerName $primaryIP -Count $PingCount -Quiet
+                } else {
+                    $false
+                }
+
+                $allResults.Add([PSCustomObject]@{
+                    vCenter          = $srv
+                    VMName           = $vm.Name
+                    PowerState       = $vm.PowerState
+                    PrimaryIP        = if ($primaryIP) { $primaryIP } else { 'N/A' }
+                    RawGuestId       = $rawGuestId
+                    NormalisedOS     = $normalisedOS
+                    ResolvedHostname = if ($resolvedHost) { $resolvedHost } else { 'N/A' }
+                    DNSMatchesVMName = $dnsMatchesVMName
+                    PingReachable    = $pingResult
+                })
+            }
+
+            Disconnect-VIServer -Server $viConn -Confirm:$false
+            Write-Host "    Disconnected from $srv" -ForegroundColor Gray
+        }
     }
 
-    $vms = Get-VM -Server $viConn
-    Write-Host "    Found $($vms.Count) VM(s)" -ForegroundColor Green
-
-    foreach ($vm in $vms) {
-        Write-Verbose "  Processing VM: $($vm.Name)"
-
-        # ── Primary IP (first NIC reported by VMware Tools) ──────────────────
-        $primaryIP = $vm.Guest.IPAddress |
-                         Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } |
-                         Select-Object -First 1
-
-        # ── OS normalisation ─────────────────────────────────────────────────
-        $rawGuestId   = $vm.ExtensionData.Config.GuestId
-        $normalisedOS = Get-NormalisedOS -GuestId $rawGuestId
-
-        # ── DNS reverse lookup ───────────────────────────────────────────────
-        $resolvedHost     = Resolve-IPtoHostname -IPAddress $primaryIP
-        $dnsMatchesVMName = if ($resolvedHost) {
-            $resolvedHost -ieq $vm.Name
-        } else {
-            $false
+    end {
+        if ($allResults.Count -eq 0) {
+            Write-Warning 'No VM data collected — nothing to export.'
+            return
         }
 
-        # ── Ping ─────────────────────────────────────────────────────────────
-        $pingResult = if ($primaryIP) {
-            Test-Connection -ComputerName $primaryIP -Count $PingCount -Quiet
-        } else {
-            $false
-        }
+        $timestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $outputPath = Join-Path $OutputDir "VMInventory_$timestamp.csv"
 
-        $allResults.Add([PSCustomObject]@{
-            vCenter          = $srv
-            VMName           = $vm.Name
-            PowerState       = $vm.PowerState
-            PrimaryIP        = if ($primaryIP) { $primaryIP } else { 'N/A' }
-            RawGuestId       = $rawGuestId
-            NormalisedOS     = $normalisedOS
-            ResolvedHostname = if ($resolvedHost) { $resolvedHost } else { 'N/A' }
-            DNSMatchesVMName = $dnsMatchesVMName
-            PingReachable    = $pingResult
-        })
+        $allResults | Export-Csv -Path $outputPath -NoTypeInformation -Encoding UTF8
+
+        Write-Host "`n[+] Exported $($allResults.Count) records to:" -ForegroundColor Green
+        Write-Host "    $outputPath" -ForegroundColor Yellow
+
+        $allResults |
+            Group-Object vCenter |
+            ForEach-Object {
+                $reachable = ($_.Group | Where-Object PingReachable).Count
+                $dnsMiss   = ($_.Group | Where-Object { -not $_.DNSMatchesVMName }).Count
+                Write-Host "`n    $($_.Name): $($_.Count) VMs | Reachable: $reachable | DNS mismatches: $dnsMiss"
+            }
+
+        if ($PassThru) { $allResults }
     }
-
-    Disconnect-VIServer -Server $viConn -Confirm:$false
-    Write-Host "    Disconnected from $srv" -ForegroundColor Gray
 }
 #endregion
 
-#region ── Export ─────────────────────────────────────────────────────────────
-if ($allResults.Count -eq 0) {
-    Write-Warning 'No VM data collected — nothing to export.'
-}
-else {
-    $timestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $outputPath = Join-Path $OutputDir "VMInventory_$timestamp.csv"
-
-    $allResults | Export-Csv -Path $outputPath -NoTypeInformation -Encoding UTF8
-
-    Write-Host "`n[+] Exported $($allResults.Count) records to:" -ForegroundColor Green
-    Write-Host "    $outputPath" -ForegroundColor Yellow
-
-    # ── Quick summary to console ─────────────────────────────────────────────
-    $allResults |
-        Group-Object vCenter |
-        ForEach-Object {
-            $reachable = ($_.Group | Where-Object PingReachable).Count
-            $dnsMiss   = ($_.Group | Where-Object { -not $_.DNSMatchesVMName }).Count
-            Write-Host "`n    $($_.Name): $($_.Count) VMs | Reachable: $reachable | DNS mismatches: $dnsMiss"
-        }
+#region ── Script entry point (only runs when executed directly, not dot-sourced)
+if ($Server) {
+    Get-VMInventory -Server $Server -Credential $Credential `
+                    -OutputDir $OutputDir -PingCount $PingCount -PassThru:$PassThru
 }
 #endregion
-```
